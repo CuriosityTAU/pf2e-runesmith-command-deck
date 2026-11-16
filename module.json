@@ -1,8 +1,8 @@
 {
   "id": "pf2e-runesmith-command-deck",
   "title": "PF2e Runesmith Command Deck",
-  "description": "Complete tactical Command Deck HUD, built-in Impossible Magic Runic Repertoire builder (all 44 Lv 1–17 & Diacritic runes), combat automation (Etch, 1A/2A Trace, Engraving Strike, Invoke Rune with Class DC saves, level-scaled damage, diacritic modifiers, and turn-based expiry), Runic Crafter manager, and visual token rune badges for Pathfinder 2e.",
-  "version": "1.0.0",
+  "description": "Complete tactical Command Deck HUD, built-in Impossible Magic Runic Repertoire builder (all 44 Lv 1–17 & Diacritic runes), combat automation (Etch, 1A/2A Trace, smart Engraving Strike weapon selector, Invoke Rune with Class DC saves, level-scaled damage, diacritic modifiers, and turn-based expiry), and Runic Crafter manager for Pathfinder 2e.",
+  "version": "1.1.0",
   "authors": [
     {
       "name": "curiosityeducation"
@@ -33,7 +33,7 @@
   ],
   "url": "https://github.com/CuriosityTAU/pf2e-runesmith-command-deck",
   "manifest": "https://github.com/CuriosityTAU/pf2e-runesmith-command-deck/releases/latest/download/module.json",
-  "download": "https://github.com/CuriosityTAU/pf2e-runesmith-command-deck/releases/download/v1.0.0/module.zip",
+  "download": "https://github.com/CuriosityTAU/pf2e-runesmith-command-deck/releases/download/v1.1.0/module.zip",
   "readme": "README.md",
   "license": "LICENSE"
 }
