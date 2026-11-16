@@ -8,6 +8,7 @@ import {
   executeEngravingStrike,
   executeFortifyingKnock,
   getActorRuneState,
+  getRankedMeleeStrikes,
   invokeActiveRunes,
   registerChatCardListeners,
   registerLifecycleHooks,
@@ -21,17 +22,7 @@ import { refreshAllTokenRuneBadges, registerCanvasBadgeHooks } from "./canvas-ba
 import { closeCommandDeck, registerUIHooks, renderCommandDeck, renderLauncherPill, toggleCommandDeck } from "./ui-deck.js";
 
 Hooks.once("init", () => {
-  console.log(`${MODULE_ID} | Initializing PF2e Runesmith Command Deck`);
-
-  game.settings.register(MODULE_ID, "showTokenBadges", {
-    name: "Show Visual Rune Badges on Tokens",
-    hint: "Displays glowing Etched (gold) and Traced (cyan) runic sigil orbs on Runebearer tokens on the canvas.",
-    scope: "client",
-    config: true,
-    type: Boolean,
-    default: true,
-    onChange: () => refreshAllTokenRuneBadges()
-  });
+  console.log(`${MODULE_ID} | Initializing PF2e Runesmith Command Deck v1.1.0`);
 
   game.settings.register(MODULE_ID, "autoOpenOnSheetAction", {
     name: "Open Command Deck on Runesmith Sheet Actions",
@@ -40,6 +31,15 @@ Hooks.once("init", () => {
     config: true,
     type: Boolean,
     default: true
+  });
+
+  game.settings.register(MODULE_ID, "autoPickBestStrike", {
+    name: "Engraving Strike: Auto-Roll Best Melee Weapon",
+    hint: "If enabled, Engraving Strike immediately rolls your highest-attack, highest-damage held melee weapon without showing the weapon picker.",
+    scope: "client",
+    config: true,
+    type: Boolean,
+    default: false
   });
 
   game.settings.register(MODULE_ID, "allowAnyCharacter", {
@@ -71,6 +71,7 @@ Hooks.once("ready", () => {
     runes: RUNES_DB,
     getRuneBySlug,
     getRunesmithLimits,
+    getRankedMeleeStrikes,
     resolveRunesmithActor,
     getActorRuneState,
     toggleRepertoireRune,

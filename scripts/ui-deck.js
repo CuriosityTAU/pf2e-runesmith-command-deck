@@ -19,6 +19,7 @@ import {
   getActorRuneState,
   getActorTokenOnCanvas,
   getCandidateRunesmithActors,
+  getRankedMeleeStrikes,
   getRunesmithClassDC,
   invokeActiveRunes,
   isRunesmithActor,
@@ -44,6 +45,7 @@ const uiState = {
   quickTargetSelf: false,
   quickFreeSlot: false,
   quickEnergy: "fire",
+  showStrikePicker: false,
   selectedInvokeIds: new Set(),
   repFilterLevel: "available", // "available" | "all" | "1" | "5" | "9" | "13" | "17"
   repFilterRole: "all",        // "all" | "base" | "diacritic" | "damage" | "buff" | "debuff" | "utility"
@@ -359,7 +361,7 @@ function renderBattleTab(actor, state, limits, effectiveTargetToken, rangePill) 
         </button>
         ${
           limits.features.hasEngravingStrike
-            ? `<button type="button" class="rcd-btn rcd-btn-crimson" data-action="engraving-strike" ${selectedQuickRune?.etchOnly ? "disabled" : ""} title="Engraving Strike (1A Flourish): Roll melee Strike; on a hit, automatically Trace ${escapeHtml(selectedQuickRune?.shortName ?? "Rune")} onto target!">
+            ? `<button type="button" class="rcd-btn rcd-btn-crimson ${uiState.showStrikePicker ? "is-open" : ""}" data-action="engraving-strike" ${selectedQuickRune?.etchOnly ? "disabled" : ""} title="Engraving Strike (1A Flourish): Choose melee weapon (or auto-use ★ Best) &amp; Trace ${escapeHtml(selectedQuickRune?.shortName ?? "Rune")} on hit!">
                 <i class="fas fa-gavel"></i> Engraving Strike
               </button>`
             : ""
@@ -372,6 +374,7 @@ function renderBattleTab(actor, state, limits, effectiveTargetToken, rangePill) 
             : ""
         }
       </div>
+      ${uiState.showStrikePicker && limits.features.hasEngravingStrike ? renderStrikePickerHtml(actor, selectedQuickRune) : ""}
     </div>
 
     <div class="rcd-invoke-bar">
@@ -408,6 +411,62 @@ function renderBattleTab(actor, state, limits, effectiveTargetToken, rangePill) 
             : `<div class="rcd-lane-empty">No Traced runes active. Use Trace Rune or Engraving Strike in combat!</div>`
         }
       </div>
+    </div>
+  `;
+}
+
+function renderStrikePickerHtml(actor, selectedQuickRune) {
+  const ranked = getRankedMeleeStrikes(actor);
+  const autoBest = Boolean(game.settings?.get(MODULE_ID, "autoPickBestStrike"));
+
+  if (!ranked.length) {
+    return `<div class="rcd-strike-picker"><div class="rcd-lane-empty">No melee strikes available on ${escapeHtml(actor.name)}.</div></div>`;
+  }
+
+  const rows = ranked
+    .map((s) => {
+      const bestBadge = s.isRecommended ? `<span class="rcd-best-badge">&#9733; Best</span>` : "";
+      const stowedTag = !s.ready ? `<span class="rcd-stowed-tag">Not Held</span>` : "";
+      const mapBtns = s.variants
+        .map(
+          (v) =>
+            `<button type="button" class="rcd-map-btn ${v.index === 0 && s.isRecommended ? "primary" : ""}" data-action="roll-engraving-strike" data-strike-idx="${s.actionIndex}" data-variant-idx="${v.index}">
+              ${escapeHtml(v.shortLabel)}
+            </button>`
+        )
+        .join("");
+
+      return `
+        <div class="rcd-strike-row ${s.isRecommended ? "recommended" : ""} ${!s.ready ? "stowed" : ""}">
+          <img src="${escapeHtml(s.img)}" alt="" />
+          <div class="rcd-strike-meta">
+            <div class="rcd-strike-title">
+              <strong>${escapeHtml(s.label)}</strong>
+              ${bestBadge}
+              ${stowedTag}
+            </div>
+            <div class="rcd-strike-dmg">${escapeHtml(s.damageSummary)}</div>
+          </div>
+          <div class="rcd-strike-variants">
+            ${mapBtns}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  return `
+    <div class="rcd-strike-picker">
+      <div class="rcd-sp-hdr">
+        <span><strong>Engraving Strike</strong> &rarr; Trace <strong>${escapeHtml(selectedQuickRune?.shortName ?? "Rune")}</strong> on Hit</span>
+        <div class="rcd-sp-hdr-right">
+          <label class="rcd-inline-toggle" title="Skip this picker and always roll the ★ Best melee weapon automatically">
+            <input type="checkbox" data-action="toggle-auto-best-strike" ${autoBest ? "checked" : ""} /> Auto-use &#9733; Best
+          </label>
+          <button type="button" class="rcd-mini-x" data-action="close-strike-picker" title="Close">&times;</button>
+        </div>
+      </div>
+      <div class="rcd-strike-list">${rows}</div>
     </div>
   `;
 }
@@ -769,6 +828,9 @@ function bindDeckDelegatedEvents(root) {
       renderCommandDeck();
     } else if (action === "toggle-free-slot") {
       uiState.quickFreeSlot = el.checked;
+    } else if (action === "toggle-auto-best-strike") {
+      await game.settings?.set(MODULE_ID, "autoPickBestStrike", Boolean(el.checked));
+      renderCommandDeck();
     } else if (action === "set-quick-energy") {
       uiState.quickEnergy = el.value;
       renderCommandDeck();
@@ -873,9 +935,35 @@ function bindDeckDelegatedEvents(root) {
         break;
       case "engraving-strike":
         if (actor && uiState.quickRuneSlug) {
-          await executeEngravingStrike(actor, { runeSlug: uiState.quickRuneSlug });
+          const ranked = getRankedMeleeStrikes(actor);
+          const autoBest = Boolean(game.settings?.get(MODULE_ID, "autoPickBestStrike"));
+          if (autoBest || ranked.length <= 1) {
+            uiState.showStrikePicker = false;
+            await executeEngravingStrike(actor, {
+              actionIndex: ranked[0]?.actionIndex ?? null,
+              variantIndex: 0,
+              runeSlug: uiState.quickRuneSlug
+            });
+          } else {
+            uiState.showStrikePicker = !uiState.showStrikePicker;
+          }
           renderCommandDeck();
         }
+        break;
+      case "roll-engraving-strike":
+        if (actor && uiState.quickRuneSlug) {
+          uiState.showStrikePicker = false;
+          await executeEngravingStrike(actor, {
+            actionIndex: Number(btn.dataset.strikeIdx),
+            variantIndex: Number(btn.dataset.variantIdx || 0),
+            runeSlug: uiState.quickRuneSlug
+          });
+          renderCommandDeck();
+        }
+        break;
+      case "close-strike-picker":
+        uiState.showStrikePicker = false;
+        renderCommandDeck();
         break;
       case "fortifying-knock":
         if (actor) {

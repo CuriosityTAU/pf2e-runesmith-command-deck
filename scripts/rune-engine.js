@@ -1169,9 +1169,97 @@ async function executeSpecialInvocationEffects(actor, level, entry, rune, diacri
 }
 
 /**
- * Engraving Strike workflow: roll melee weapon Strike -> on hit/crit, automatically Trace chosen rune onto target!
+ * Inspect and rank all melee Strikes on the actor by readiness, attack modifier, expected damage, and weapon priority.
  */
-export async function executeEngravingStrike(actor, { strikeIndex = 0, runeSlug, targetToken = null } = {}) {
+export function getRankedMeleeStrikes(actor) {
+  const actions = actor?.system?.actions ?? [];
+  const strMod = Number(actor?.system?.abilities?.str?.mod ?? 0);
+  const dexMod = Number(actor?.system?.abilities?.dex?.mod ?? 0);
+  const candidates = [];
+
+  actions.forEach((a, actionIndex) => {
+    if (!a || !a.variants?.length) return;
+    if (a.type && a.type !== "strike") return;
+    if (a.item?.isRanged && a.item?.isMelee !== true) return;
+    if (a.item?.isMelee === false) return;
+
+    const label = a.label || a.item?.name || "Melee Strike";
+    const slug = a.slug || a.item?.slug || "";
+    const ready = a.ready !== false;
+
+    let attackMod = Number(a.totalModifier ?? a.modifier ?? NaN);
+    if (!Number.isFinite(attackMod)) {
+      const m = String(a.variants?.[0]?.label || "").match(/([+-]\d+)/);
+      attackMod = m ? Number(m[1]) : 0;
+    }
+
+    const traits = a.item?.system?.traits?.value ?? [];
+    const isShield =
+      a.item?.type === "shield" ||
+      a.item?.category === "shield" ||
+      /shield/i.test(slug) ||
+      /shield/i.test(label);
+    const isUnarmed =
+      a.item?.category === "unarmed" ||
+      slug === "basic-unarmed" ||
+      traits.includes("unarmed");
+    const isTrueWeapon = a.item?.type === "weapon" && !isShield && !isUnarmed;
+
+    const dmg = a.item?.system?.damage ?? a.item?.baseDamage ?? {};
+    const dice = Math.max(1, Number(dmg.dice) || (isShield || isUnarmed ? 1 : 1));
+    const dieStr = String(dmg.die || (isUnarmed || isShield ? "d4" : "d6"));
+    const dieFaces = Number(dieStr.replace(/\D/g, "")) || 4;
+    const dmgType = dmg.damageType || "";
+    const flatMod = strMod + (Number(dmg.modifier) || 0);
+    const avgDamage = dice * ((dieFaces + 1) / 2) + flatMod;
+
+    const modText = flatMod > 0 ? `+${flatMod}` : flatMod < 0 ? `${flatMod}` : "";
+    const damageSummary = `${dice}d${dieFaces}${modText}${dmgType ? ` ${dmgType}` : ""}`;
+
+    const variants = a.variants.slice(0, 3).map((v, vIdx) => {
+      const vm = String(v.label || "").match(/([+-]\d+)/);
+      const fallbackMod = attackMod - vIdx * (traits.includes("agile") ? 4 : 5);
+      const vMod = vm ? Number(vm[1]) : fallbackMod;
+      const signStr = vMod >= 0 ? `+${vMod}` : `${vMod}`;
+      return {
+        index: vIdx,
+        mod: vMod,
+        shortLabel: vIdx === 0 ? `1st (${signStr})` : vIdx === 1 ? `2nd (${signStr})` : `3rd (${signStr})`
+      };
+    });
+
+    candidates.push({
+      actionIndex,
+      slug,
+      label,
+      img: a.item?.img || "icons/skills/melee/weapons-crossed-swords-yellow.webp",
+      ready,
+      isShield,
+      isUnarmed,
+      isTrueWeapon,
+      attackMod,
+      avgDamage,
+      damageSummary,
+      variants,
+      score:
+        (ready ? 100000 : 0) +
+        attackMod * 100 +
+        avgDamage * 10 +
+        (isTrueWeapon ? 3 : !isShield && !isUnarmed ? 2 : isShield ? 1 : 0)
+    });
+  });
+
+  candidates.sort((a, b) => b.score - a.score);
+  candidates.forEach((c, idx) => {
+    c.isRecommended = idx === 0;
+  });
+  return candidates;
+}
+
+/**
+ * Engraving Strike workflow: roll chosen (or best-ranked) melee weapon Strike -> on hit/crit, automatically Trace chosen rune onto target!
+ */
+export async function executeEngravingStrike(actor, { actionIndex = null, variantIndex = 0, runeSlug, targetToken = null } = {}) {
   const rune = getRuneBySlug(runeSlug);
   if (!actor || !rune) {
     ui.notifications?.warn("Choose a rune from your repertoire for Engraving Strike!");
@@ -1183,10 +1271,16 @@ export async function executeEngravingStrike(actor, { strikeIndex = 0, runeSlug,
     return;
   }
 
-  const strikes = (actor.system?.actions ?? []).filter((a) => a.type === "strike" && a.item?.isMelee !== false);
-  const strike = strikes[strikeIndex] ?? strikes[0];
-  if (!strike?.variants?.[0]?.roll) {
-    ui.notifications?.warn(`No melee Strike found on ${actor.name}!`);
+  const ranked = getRankedMeleeStrikes(actor);
+  const chosenMeta =
+    actionIndex !== null && actionIndex !== undefined
+      ? ranked.find((s) => s.actionIndex === Number(actionIndex)) ?? ranked[0]
+      : ranked[0];
+
+  const strike = chosenMeta ? actor.system?.actions?.[chosenMeta.actionIndex] : null;
+  const variant = strike?.variants?.[variantIndex] ?? strike?.variants?.[0];
+  if (!variant?.roll) {
+    ui.notifications?.warn(`No ready melee Strike found on ${actor.name}!`);
     return;
   }
 
@@ -1206,24 +1300,28 @@ export async function executeEngravingStrike(actor, { strikeIndex = 0, runeSlug,
   });
 
   try {
-    await strike.variants[0].roll({});
+    await variant.roll({});
   } finally {
     Hooks.off("createChatMessage", hookId);
   }
 
   const hitSuccess = capturedOutcome === "success" || capturedOutcome === "criticalSuccess";
   if (hitSuccess) {
-    ui.notifications?.info(`Engraving Strike hit (${capturedOutcome})! Tracing ${rune.shortName} onto ${resolvedTarget.name}!`);
+    ui.notifications?.info(
+      `Engraving Strike (${chosenMeta.label}) hit (${capturedOutcome})! Tracing ${rune.shortName} onto ${resolvedTarget.name}!`
+    );
     await applyRuneToTarget(actor, {
       runeSlug: rune.slug,
       mode: "traced",
       actionCost: 0,
       targetToken: resolvedTarget,
       skipRangeCheck: true,
-      sourceLabel: "Engraving Strike"
+      sourceLabel: `Engraving Strike (${chosenMeta.label})`
     });
   } else if (capturedOutcome) {
-    ui.notifications?.info(`Engraving Strike missed (${capturedOutcome}) — ${rune.shortName} was not traced.`);
+    ui.notifications?.info(
+      `Engraving Strike (${chosenMeta.label}) missed (${capturedOutcome}) — ${rune.shortName} was not traced.`
+    );
   }
 }
 
