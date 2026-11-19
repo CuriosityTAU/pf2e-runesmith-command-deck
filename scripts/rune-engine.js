@@ -6,7 +6,7 @@ import {
   getRuneBySlug,
   getRunesmithLimits,
   isDiacriticCompatible
-} from "./runes-db.js";
+} from "./runes-db.js?v=1.3.0";
 
 export const MODULE_ID = "pf2e-runesmith-command-deck";
 export const SOCKET_NAME = `module.${MODULE_ID}`;
@@ -251,6 +251,20 @@ export async function performTargetActorOp(targetActor, operation, payload = {})
         await targetActor.update({ "system.attributes.hp.value": nextHp });
         return { healed: nextHp - curHp };
       }
+      case "repairShield": {
+        const repairAmt = Math.max(0, Math.trunc(Number(payload.amount) || 0));
+        const shields = targetActor.itemTypes?.shield ?? [];
+        const specific = payload.subTargetId ? targetActor.items?.get?.(payload.subTargetId) : null;
+        const shield = (specific?.type === "shield" ? specific : null) ?? shields.find((s) => s.isEquipped) ?? shields[0] ?? null;
+        if (!shield || repairAmt <= 0) return { repaired: 0 };
+        const curSHp = Number(shield.system?.hp?.value ?? 0);
+        const maxSHp = Number(shield.system?.hp?.max ?? curSHp);
+        const nextSHp = Math.min(maxSHp, curSHp + repairAmt);
+        if (nextSHp > curSHp) {
+          await shield.update({ "system.hp.value": nextSHp });
+        }
+        return { repaired: nextSHp - curSHp };
+      }
       case "applyCondition": {
         const slug = String(payload.slug || "").toLowerCase();
         const val = payload.value ? Number(payload.value) : undefined;
@@ -259,6 +273,24 @@ export async function performTargetActorOp(targetActor, operation, payload = {})
           await targetActor.increaseCondition(slug, { min: val ?? 1, value: val ?? 1 });
         }
         return { condition: slug };
+      }
+      case "applyPersistent": {
+        const formula = String(payload.formula || "").trim();
+        const damageType = String(payload.damageType || "untyped").trim().toLowerCase();
+        if (!formula || !game.pf2e?.ConditionManager) return null;
+        const baseCond = game.pf2e.ConditionManager.getCondition("persistent-damage")?.toObject?.();
+        if (!baseCond) return null;
+        const merged = foundry.utils.mergeObject(baseCond, {
+          system: {
+            persistent: {
+              formula,
+              damageType,
+              dc: 15
+            }
+          }
+        });
+        await targetActor.createEmbeddedDocuments("Item", [merged]);
+        return { persistent: `${formula} ${damageType}` };
       }
       case "reduceFrightened": {
         const dec = Math.max(1, Number(payload.amount) || 2);
@@ -317,7 +349,9 @@ const ALLOWED_SOCKET_OPS = new Set([
   "deleteEffect",
   "applyDamage",
   "applyHealing",
+  "repairShield",
   "applyCondition",
+  "applyPersistent",
   "reduceFrightened",
   "raiseShieldHoltrik",
   "teleportToken"
@@ -355,11 +389,15 @@ function isAuthorizedSocketSender(senderUserId, operation, payload) {
   if (operation === "createEffect") {
     const item = payload?.itemData;
     if (!item || item.type !== "effect" || typeof item.name !== "string") return false;
-  } else if (operation === "applyDamage" || operation === "applyHealing") {
+  } else if (operation === "applyDamage" || operation === "applyHealing" || operation === "repairShield") {
     const amt = Number(payload?.amount);
     if (!Number.isFinite(amt) || amt < 0 || amt > 500) return false;
   } else if (operation === "applyCondition") {
     if (!ALLOWED_CONDITIONS.has(String(payload?.slug || "").toLowerCase())) return false;
+  } else if (operation === "applyPersistent") {
+    const formula = String(payload?.formula || "").trim();
+    const dmgType = String(payload?.damageType || "").trim().toLowerCase();
+    if (!/^(?:\d+d\d+(?:\s*[+-]\s*\d+)?|\d+)$/i.test(formula) || !/^[a-z-]+$/.test(dmgType)) return false;
   }
   return true;
 }
@@ -947,6 +985,8 @@ export async function invokeActiveRunes(actor, activeRuneIds = [], { maxAllowed 
 
     const extraNotes = [];
     let savePenaltyBearer = 0;
+    const damageModifiers = [];
+    const extraPersistentInstances = [];
 
     if (dmgSpec && diacritic) {
       if (diacritic.slug === "ti-diacritic" && ELEMENTAL_TYPES.includes(entry.diacriticElement || "fire")) {
@@ -965,16 +1005,20 @@ export async function invokeActiveRunes(actor, activeRuneIds = [], { maxAllowed 
       }
       if (diacritic.slug === "kit-diacritic") {
         savePenaltyBearer = -1;
+        damageModifiers.push("nonlethal");
         extraNotes.push("Kit- Mercy: Nonlethal; rune-bearer takes –1 status penalty to save.");
       }
       if (diacritic.slug === "inth-diacritic") {
+        damageModifiers.push("unholy");
         const fDice = `${2 + Math.max(0, Math.floor((limits.level - 13) / 2)) * 2}d4`;
+        extraPersistentInstances.push(`${fDice}[persistent,fire]`);
         extraNotes.push(`Inth- Corruption (Unholy): Target also takes @Damage[${fDice}[persistent,fire]].`);
       }
     }
 
     if (diacritic?.slug === "sar-diacritic") {
-      extraNotes.push("Sar- Righteousness (Holy): Target also becomes Drained 1.");
+      if (dmgSpec) damageModifiers.push("holy");
+      extraNotes.push("Sar- Righteousness (Holy): Target also becomes @UUID[Compendium.pf2e.conditionitems.Item.4D2KBtexWXa6oUMR]{Drained 1}.");
     }
     if (diacritic?.slug === "fob-diacritic" && !dmgSpec) {
       extraNotes.push(`Fob- Doubling: ${actor.name} also receives this non-damaging invocation benefit!`);
@@ -1009,13 +1053,12 @@ export async function invokeActiveRunes(actor, activeRuneIds = [], { maxAllowed 
         saveBasic: Boolean(rune.invocation?.save?.basic),
         savePenalty: t.isBearer ? savePenaltyBearer : 0,
         saveRoll: null,
-        degree: null,
-        damageApplied: false
+        degree: null
       });
     }
 
-    // Execute immediate automatic special effects
-    await executeSpecialInvocationEffects(actor, limits.level, entry, rune, diacritic, targets);
+    // Execute immediate automatic non-HP special effects & collect expanded effect metadata
+    const grantedEffectMeta = await executeSpecialInvocationEffects(actor, limits.level, entry, rune, diacritic, targets);
 
     if (diacritic?.slug === "sar-diacritic") {
       for (const t of targets) {
@@ -1029,6 +1072,27 @@ export async function invokeActiveRunes(actor, activeRuneIds = [], { maxAllowed 
       runeEntryId: entry.id
     });
 
+    // Healing formulas (e.g. Germantria, Xinsala, Cruonign self-heal) rolled as native PF2e Healing rolls
+    let healingFormula = null;
+    if (rune.invocation?.special === "heal-partnership" && typeof rune.invocation.healAmount === "function") {
+      healingFormula = `${rune.invocation.healAmount(limits.level)}[healing]`;
+    } else if (rune.slug === "xinsala") {
+      healingFormula = `70[healing]`;
+    } else if (typeof rune.invocation?.selfHeal === "function") {
+      extraNotes.push(`If any creature takes damage, wielder regains @Damage[${rune.invocation.selfHeal(limits.level)}[healing]] HP.`);
+    }
+
+    const combinedTraits = Array.from(
+      new Set([
+        "invocation",
+        "magical",
+        "runesmith",
+        ...(rune.traits || []).filter((t) => t !== "rune"),
+        ...(rune.invocation?.traits || []),
+        ...damageModifiers
+      ])
+    );
+
     const combinedTitle = diacritic ? `${diacritic.prefix}${rune.name}` : rune.name;
     invocationBlocks.push({
       blockId: foundry.utils.randomID(),
@@ -1037,19 +1101,29 @@ export async function invokeActiveRunes(actor, activeRuneIds = [], { maxAllowed 
       shortName: diacritic ? `${diacritic.prefix}${rune.shortName}` : rune.shortName,
       icon: rune.icon,
       color: rune.color,
+      traits: combinedTraits,
+      usageText: rune.usageText || "",
+      passiveSummary: rune.passiveSummary(limits.level, entry.energyChoice || "fire"),
       bearerName: entry.targetName,
       bearerTokenId: entry.targetTokenId,
       bearerSceneId: entry.targetSceneId,
       bearerActorUuid: entry.targetActorUuid,
       summary: rune.invocation.summary(limits.level, entry.energyChoice || "fire"),
+      emanationFeet: diacritic?.slug === "en-diacritic" && dmgSpec ? 15 : (rune.invocation?.emanationFeet ?? null),
+      targetMode: rune.invocation?.targetMode ?? "bearer",
       damageDice: dmgSpec?.dice ?? null,
       damageType: dmgSpec?.type ?? null,
+      damageModifiers,
+      extraPersistentInstances,
+      healingFormula,
       critFailPersistent: dmgSpec?.critFailPersistent ?? null,
       critFailPersistentType: dmgSpec?.critFailPersistentType ?? null,
       rolledDamageTotal: null,
       saveStatistic: rune.invocation?.save?.statistic ?? null,
       saveBasic: Boolean(rune.invocation?.save?.basic),
+      unwillingOnly: Boolean(rune.invocation?.save?.unwillingOnly),
       special: rune.invocation?.special ?? null,
+      grantedEffectMeta,
       successConditions: rune.invocation?.successConditions ?? [],
       failConditions: rune.invocation?.failConditions ?? [],
       critFailConditions: rune.invocation?.critFailConditions ?? [],
@@ -1066,14 +1140,31 @@ export async function invokeActiveRunes(actor, activeRuneIds = [], { maxAllowed 
     return s;
   });
 
-  // Post interactive Invocation Chat Card
-  await postInvocationChatCard(actor, {
+  const cardState = {
     actionLabel,
     classDC,
     level: limits.level,
     sourceTokenId: sourceToken?.id ?? null,
     blocks: invocationBlocks
-  });
+  };
+
+  // 1) Post expanded Invocation & Effect details card first
+  const invMsg = await postInvocationChatCard(actor, cardState);
+
+  // 2) Automatically roll real native PF2e DamageRoll / Healing cards (with Damage | Half | Double | Shield Block buttons!)
+  let stateChangedByRolls = false;
+  for (const block of cardState.blocks) {
+    if (block.damageDice || block.healingFormula) {
+      const total = await rollNativePf2eDamageCard(actor, cardState, block);
+      if (total !== null) {
+        block.rolledDamageTotal = total;
+        stateChangedByRolls = true;
+      }
+    }
+  }
+  if (stateChangedByRolls && invMsg?.update) {
+    await updateInvocationMessage(invMsg, cardState);
+  }
 
   // Handle Sun- Preservation auto-retrace
   for (const prev of sunRetraces) {
@@ -1092,53 +1183,111 @@ export async function invokeActiveRunes(actor, activeRuneIds = [], { maxAllowed 
 
 async function executeSpecialInvocationEffects(actor, level, entry, rune, diacritic, targets) {
   const spec = rune.invocation?.special;
-  if (!spec) return;
+  if (!spec) return null;
 
   if (spec === "raise-shield-holtrik") {
     await executeOnTargetActor(entry.targetActorUuid, "raiseShieldHoltrik", { level });
     if (diacritic?.slug === "fob-diacritic" && entry.targetActorUuid !== actor.uuid) {
       await executeOnTargetActor(actor.uuid, "raiseShieldHoltrik", { level });
     }
-  } else if (spec === "reduce-frightened-2") {
+    return {
+      name: "Invocation: Holtrik (+1 Status AC & Raise a Shield)",
+      durationLabel: "1 round (until start of bearer's next turn)",
+      details: "Immediately Raises the rune-bearing Shield and grants a +1 status bonus to AC while raised.",
+      effectItemData: buildEffectItemData({
+        name: "Invocation: Holtrik (+1 Status AC)",
+        icon: rune.icon,
+        description: "<p>Granted by invoking <strong>Holtrik, Rune of Dwarven Ramparts</strong>: +1 status bonus to AC while your shield remains raised until the start of your next turn.</p>",
+        level,
+        durationRounds: 1,
+        expiry: "turn-start",
+        rules: [{ key: "FlatModifier", selector: ["ac"], value: 1, type: "status", label: "Holtrik Invocation" }]
+      })
+    };
+  }
+  if (spec === "reduce-frightened-2") {
     for (const t of targets) {
       if (t.actorUuid) await executeOnTargetActor(t.actorUuid, "reduceFrightened", { amount: 2 });
     }
-  } else if (spec === "heal-partnership") {
+    return {
+      name: "Baruiel Aura Release",
+      durationLabel: "Instantaneous (10-ft emanation)",
+      details: "Each ally within 10 feet of the rune-bearer reduces their Frightened condition value by 2.",
+      effectItemData: null
+    };
+  }
+  if (spec === "heal-partnership") {
     const heal = rune.invocation.healAmount(level);
-    await executeOnTargetActor(entry.targetActorUuid, "applyHealing", { amount: heal });
-    await executeOnTargetActor(actor.uuid, "applyHealing", { amount: heal });
-  } else if (spec === "grant-marssyl-invocation") {
+    return {
+      name: "Germantria Vital Release",
+      durationLabel: "Instantaneous Healing",
+      details: `Heals both ${actor.name} and ${entry.targetName} for ${heal} HP each (use the PF2e Heal button below on either token, or click Heal Both to apply to both at once).`,
+      healPairAmount: heal,
+      runesmithUuid: actor.uuid,
+      bearerUuid: entry.targetActorUuid,
+      effectItemData: null
+    };
+  }
+  if (spec === "grant-marssyl-invocation") {
     const eff = buildEffectItemData({
       name: "Invocation: Marssyl (+1 Weapon Damage Die & Push)",
       icon: rune.icon,
-      description: "<p>Next successful bludgeoning Strike before end of next turn deals +1 weapon damage die and forces Fortitude save vs Class DC or pushes 10 ft (20 ft on crit fail).</p>",
+      description: "<p>Next successful bludgeoning Strike before end of wielder's next turn deals +1 weapon damage die and forces a Fortitude save vs Runesmith Class DC or pushes the target 10 ft (20 ft on critical failure).</p>",
       level,
       durationRounds: 1,
       rules: [{ key: "DamageDice", selector: ["strike-damage"], diceNumber: 1, label: "Marssyl Invocation" }]
     });
     await executeOnTargetActor(entry.targetActorUuid, "createEffect", { itemData: eff });
-  } else if (spec === "grant-rehgog-invocation") {
+    return {
+      name: eff.name,
+      durationLabel: "1 round",
+      details: "+1 weapon damage die on next bludgeoning Strike; target attempts Fortitude save vs Class DC or is pushed 10 ft (20 ft on crit fail).",
+      effectItemData: eff
+    };
+  }
+  if (spec === "grant-rehgog-invocation") {
     const eff = buildEffectItemData({
       name: "Invocation: Rehgog (+1 Unarmed Damage Die)",
       icon: rune.icon,
-      description: "<p>Free Step, and next unarmed Strike before start of Runesmith's next turn deals +1 weapon damage die.</p>",
+      description: "<p>Bearer immediately Steps as a free action, and their next unarmed Strike before the start of the Runesmith's next turn deals +1 weapon damage die.</p>",
       level,
       durationRounds: 1,
       rules: [{ key: "DamageDice", selector: ["unarmed-damage"], diceNumber: 1, label: "Rehgog Invocation" }]
     });
     await executeOnTargetActor(entry.targetActorUuid, "createEffect", { itemData: eff });
-  } else if (spec === "grant-ulgatus-invocation") {
+    return {
+      name: eff.name,
+      durationLabel: "1 round",
+      details: "Free-action Step + next unarmed Strike deals 1 additional weapon damage die.",
+      effectItemData: eff
+    };
+  }
+  if (spec === "grant-ulgatus-invocation") {
     const resVal = level >= 17 ? 20 : 10;
     const eff = buildEffectItemData({
       name: `Invocation: Ulgatus (Crit Resistance ${resVal})`,
       icon: rune.icon,
-      description: `<p>Resistance ${resVal} to critical hits for 1 minute.</p>`,
+      description: `<p>Wearer gains resistance ${resVal} to critical hits for 1 minute.</p>`,
       level,
       durationRounds: 10,
       rules: [{ key: "Resistance", type: "critical-hits", value: resVal }]
     });
     await executeOnTargetActor(entry.targetActorUuid, "createEffect", { itemData: eff });
-  } else if (spec === "grant-yudici-invocation") {
+    return {
+      name: eff.name,
+      durationLabel: "1 minute (10 rounds)",
+      details: `Grants Resistance ${resVal} against all damage from critical hits.`,
+      effectItemData: eff
+    };
+  }
+  if (spec === "grant-yudici-invocation") {
+    const shieldHeal = 40 + Math.max(0, Math.floor((level - 9) / 3)) * 10;
+    if (entry.targetActorUuid) {
+      await executeOnTargetActor(entry.targetActorUuid, "repairShield", {
+        amount: shieldHeal,
+        subTargetId: entry.subTargetId || null
+      });
+    }
     const eff = buildEffectItemData({
       name: "Invocation: Yudici (+1 Status Attack & Skills)",
       icon: rune.icon,
@@ -1150,11 +1299,18 @@ async function executeSpecialInvocationEffects(actor, level, entry, rune, diacri
     for (const t of targets) {
       if (t.actorUuid) await executeOnTargetActor(t.actorUuid, "createEffect", { itemData: eff });
     }
-  } else if (spec === "grant-xinsala-invocation") {
+    return {
+      name: eff.name,
+      durationLabel: "1 round (10-ft emanation)",
+      details: `Rune-bearing shield automatically regains up to ${shieldHeal} HP, and allies in a 10-ft emanation gain +1 status bonus to attack rolls and skill checks.`,
+      effectItemData: eff
+    };
+  }
+  if (spec === "grant-xinsala-invocation") {
     const eff = buildEffectItemData({
       name: "Invocation: Xinsala (+20-ft Speed & Quickened)",
       icon: rune.icon,
-      description: "<p>+20-ft status bonus to Speeds and Quickened (Stride or Strike) for 1 round.</p>",
+      description: "<p>+20-ft status bonus to Speeds and Quickened (extra action for Stride or Strike) for 1 round.</p>",
       level,
       durationRounds: 1,
       rules: [
@@ -1165,7 +1321,14 @@ async function executeSpecialInvocationEffects(actor, level, entry, rune, diacri
     for (const t of targets) {
       if (t.actorUuid) await executeOnTargetActor(t.actorUuid, "createEffect", { itemData: eff });
     }
+    return {
+      name: eff.name,
+      durationLabel: "1 round (30-ft aura)",
+      details: "70 HP healing pool (select recipient token and Shift+Click PF2e's Heal button below to adjust/split amount per creature); allies in 30-ft aura gain +20-ft status bonus to Speeds and Quickened (Stride/Strike).",
+      effectItemData: eff
+    };
   }
+  return null;
 }
 
 /**
@@ -1468,8 +1631,188 @@ export function registerLifecycleHooks() {
 }
 
 // ===========================================================================
-// CHAT CARDS & INTERACTIVE SAVE / DAMAGE RESOLUTION
+// CHAT CARDS, EXPANDED EFFECTS & NATIVE PF2E DAMAGE ROLLS
 // ===========================================================================
+
+const PF2E_CONDITION_UUIDS = {
+  blinded: "Compendium.pf2e.conditionitems.Item.XgEqL1kFApUbl5Z2",
+  clumsy: "Compendium.pf2e.conditionitems.Item.i3OJZU2nk64Df3xm",
+  concealed: "Compendium.pf2e.conditionitems.Item.DmAIPqOBomZ7H95W",
+  dazzled: "Compendium.pf2e.conditionitems.Item.TkIyaNPgTZFBCCuh",
+  doomed: "Compendium.pf2e.conditionitems.Item.3uh1r86TzbQvosxv",
+  drained: "Compendium.pf2e.conditionitems.Item.4D2KBtexWXa6oUMR",
+  enfeebled: "Compendium.pf2e.conditionitems.Item.MIRkyAjyBeXivMa7",
+  "off-guard": "Compendium.pf2e.conditionitems.Item.AJh5ex99aV6VTggg",
+  quickened: "Compendium.pf2e.conditionitems.Item.nlCjDvLMf2EkV2dl",
+  restrained: "Compendium.pf2e.conditionitems.Item.VcDeM8A5oI6VqhbM",
+  slowed: "Compendium.pf2e.conditionitems.Item.xYTAsEpcJE1Ccni3",
+  stupefied: "Compendium.pf2e.conditionitems.Item.e1XGnhKNSQIm5IXg"
+};
+
+function formatConditionEnricher(cond) {
+  const slug = String(cond?.slug || "").toLowerCase();
+  const labelCap = slug.charAt(0).toUpperCase() + slug.slice(1);
+  const label = cond?.value ? `${labelCap} ${cond.value}` : labelCap;
+  const dur = cond?.durationRounds ? ` (${cond.durationRounds} round${cond.durationRounds > 1 ? "s" : ""})` : "";
+  const uuid = PF2E_CONDITION_UUIDS[slug];
+  return uuid ? `@UUID[${uuid}]{${label}}${dur}` : `<strong>${escapeHtml(label)}</strong>${escapeHtml(dur)}`;
+}
+
+async function enrichHtmlSafe(html, rollData = {}) {
+  try {
+    const enricher = foundry?.applications?.ux?.TextEditor?.implementation?.enrichHTML;
+    if (typeof enricher === "function") {
+      return await enricher(html, { rollData, async: true });
+    }
+  } catch (_e) {
+    // Fallback to raw HTML in headless test environments
+  }
+  return html;
+}
+
+/**
+ * Convert a rune invocation block's damage / healing spec into a PF2e InstancePool DamageRoll formula.
+ */
+export function buildPf2eDamagePoolFormula(block) {
+  if (block.healingFormula) {
+    return `(${block.healingFormula.replace(/\[healing\]/i, "")})[healing]`;
+  }
+  if (!block.damageDice) return null;
+
+  const mods = Array.isArray(block.damageModifiers) && block.damageModifiers.length > 0
+    ? `,${block.damageModifiers.join(",")}`
+    : "";
+
+  let primaryExpr;
+  if (block.damageDice.includes("[")) {
+    // Multi-instance expression e.g. "3d10[bludgeoning] + 8d6[fire]" -> comma-separated InstancePool
+    primaryExpr = block.damageDice.replace(/\]\s*\+\s*/g, "], ");
+    if (mods) {
+      primaryExpr = primaryExpr.replace(/\[([^\]]+)\]/g, (_m, inner) => `[${inner}${mods}]`);
+    }
+  } else {
+    const typeTag = `${block.damageType || "untyped"}${mods}`;
+    primaryExpr = `(${block.damageDice})[${typeTag}]`;
+  }
+
+  const parts = [primaryExpr];
+  for (const pInst of block.extraPersistentInstances || []) {
+    parts.push(pInst);
+  }
+  return parts.join(", ");
+}
+
+/**
+ * Roll and post a genuine PF2e DamageRoll chat card so the GM and players get native
+ * PF2e [Damage] | [Half] | [Double] | [Shield Block] / [Heal] buttons and full IWR automation!
+ */
+export async function rollNativePf2eDamageCard(actor, cardState, block) {
+  const formula = buildPf2eDamagePoolFormula(block);
+  if (!formula) return null;
+
+  const DamageRollClass = CONFIG?.Dice?.rolls?.find((R) => R.name === "DamageRoll") || Roll;
+  const rollData = actor?.getRollData?.() ?? {};
+
+  let dRoll;
+  try {
+    dRoll = new DamageRollClass(formula, rollData);
+    await dRoll.evaluate();
+  } catch (err) {
+    console.warn(`${MODULE_ID} | DamageRoll fallback to standard Roll for "${formula}":`, err);
+    dRoll = await new Roll(formula, rollData).evaluate();
+  }
+
+  const allTraits = Array.from(new Set(block.traits || ["invocation", "magical", "runesmith"]));
+  const traitsTagsHtml = allTraits
+    .map((t) => `<span class="tag" data-trait="${escapeHtml(t)}">${escapeHtml(t)}</span>`)
+    .join("");
+
+  const saveSubHeader = block.saveStatistic
+    ? `<div class="rcd-dmg-flavor-sub">Save: <strong>${block.saveBasic ? "Basic " : ""}${escapeHtml(block.saveStatistic.charAt(0).toUpperCase() + block.saveStatistic.slice(1))}</strong> vs <strong>DC ${cardState.classDC}</strong> &bull; Target: <strong>${escapeHtml(block.targets.map((t) => t.name).join(", ") || block.bearerName)}</strong></div>`
+    : `<div class="rcd-dmg-flavor-sub">Target: <strong>${escapeHtml(block.targets.map((t) => t.name).join(", ") || block.bearerName)}</strong></div>`;
+
+  const critFailExtraNote = block.critFailPersistent
+    ? `<div class="rcd-dmg-flavor-note">Crit Fail Rider: <strong>${escapeHtml(block.critFailPersistent)} persistent ${escapeHtml(block.critFailPersistentType || block.damageType || "")}</strong></div>`
+    : "";
+
+  const flavorHtml = `
+    <h4 class="action"><strong>${escapeHtml(block.runeName)}</strong> — ${block.healingFormula ? "Invocation Healing" : "Invocation Damage"}</h4>
+    <div class="tags" data-tooltip-class="pf2e">${traitsTagsHtml}</div>
+    <hr />
+    ${saveSubHeader}
+    ${critFailExtraNote}
+  `;
+
+  // Resolve primary target token UUID for PF2e context & Toolbelt Target Helper
+  const firstTarget = block.targets?.[0] ?? null;
+  const firstTok = firstTarget?.tokenId && canvas?.ready ? canvas.tokens?.get(firstTarget.tokenId) : null;
+  const targetTokenUuid = firstTok?.document?.uuid ?? (firstTarget?.sceneId && firstTarget?.tokenId ? `Scene.${firstTarget.sceneId}.Token.${firstTarget.tokenId}` : null);
+
+  const pf2eFlags = {
+    context: {
+      type: "damage-roll",
+      sourceType: block.saveStatistic ? "save" : "attack",
+      actor: actor?.id ?? null,
+      domains: ["damage", "all"],
+      traits: allTraits,
+      options: [
+        ...allTraits.map((t) => `item:trait:${t}`),
+        ...(block.saveBasic ? ["damaging-effect"] : [])
+      ],
+      target: targetTokenUuid && firstTarget?.actorUuid ? { actor: firstTarget.actorUuid, token: targetTokenUuid } : null,
+      outcome: null
+    },
+    origin: {
+      actor: actor?.uuid ?? null,
+      sourceId: actor?.id ?? null,
+      type: "action"
+    }
+  };
+
+  const msgFlags = {
+    pf2e: pf2eFlags,
+    [MODULE_ID]: {
+      cardType: "invocation-damage",
+      runeSlug: block.runeSlug,
+      blockId: block.blockId
+    }
+  };
+
+  if (block.saveStatistic && game.modules?.get?.("pf2e-toolbelt")?.active) {
+    const targetUuids = (block.targets || [])
+      .map((t) => {
+        const tk = t.tokenId && canvas?.ready ? canvas.tokens?.get(t.tokenId) : null;
+        return tk?.document?.uuid ?? (t.sceneId && t.tokenId ? `Scene.${t.sceneId}.Token.${t.tokenId}` : null);
+      })
+      .filter(Boolean);
+
+    msgFlags["pf2e-toolbelt"] = {
+      targetHelper: {
+        type: "action",
+        author: actor?.uuid ?? null,
+        traits: allTraits,
+        options: block.saveBasic ? ["damaging-effect"] : [],
+        saveVariants: {
+          null: {
+            basic: Boolean(block.saveBasic),
+            dc: cardState.classDC,
+            statistic: block.saveStatistic
+          }
+        },
+        targets: targetUuids
+      }
+    };
+  }
+
+  const sourceTok = cardState.sourceTokenId && canvas?.ready ? canvas.tokens?.get(cardState.sourceTokenId) : null;
+  await dRoll.toMessage({
+    speaker: ChatMessage.getSpeaker({ actor, token: sourceTok?.document ?? sourceTok }),
+    flavor: flavorHtml,
+    flags: msgFlags
+  });
+
+  return Math.max(0, Number(dRoll.total) || 0);
+}
 
 async function postRuneAppliedChatCard(actor, {
   rune,
@@ -1493,6 +1836,7 @@ async function postRuneAppliedChatCard(actor, {
   const traitsHtml = rune.traits
     .map((t) => `<span class="rcd-trait">${escapeHtml(t)}</span>`)
     .join("");
+  const durationNote = mode === "etched" ? "Sustained (unlimited until invoked/replaced)" : "Until end of Runesmith's next turn";
 
   const rawHtml = `
     <div class="rcd-chat-card" style="--rcd-accent:${rune.color}">
@@ -1506,33 +1850,101 @@ async function postRuneAppliedChatCard(actor, {
       ${viaTxt}
       <div class="rcd-trait-row">${traitsHtml}</div>
       <div class="rcd-chat-body">
-        <p><strong>Bearer Passive:</strong> ${escapeHtml(passiveDesc)}</p>
-        <p class="rcd-chat-inv-preview"><strong>Invocation Preview:</strong> ${escapeHtml(rune.invocation.summary(level, energyChoice || "fire"))}</p>
+        <div class="rcd-effect-box">
+          <div class="rcd-effect-hdr">
+            <span><strong>Active Bearer Effect</strong> (${escapeHtml(rune.usageText)})</span>
+            <span class="rcd-effect-dur">${escapeHtml(durationNote)}</span>
+          </div>
+          <p>${escapeHtml(passiveDesc)}</p>
+        </div>
+        <p class="rcd-chat-inv-preview"><strong>When Invoked [1A]:</strong> ${escapeHtml(rune.invocation.summary(level, energyChoice || "fire"))}</p>
       </div>
     </div>
   `;
 
+  const enrichedContent = await enrichHtmlSafe(rawHtml, actor?.getRollData?.() ?? {});
   await ChatMessage.create({
     speaker: ChatMessage.getSpeaker({ actor }),
-    content: rawHtml,
+    content: enrichedContent,
     flags: { [MODULE_ID]: { cardType: "rune-applied", runeSlug: rune.slug } }
   });
 }
 
-function renderInvocationCardHtml(cardState) {
+async function renderInvocationCardHtml(cardState, rollData = {}) {
   const blocksHtml = cardState.blocks
     .map((b) => {
-      const saveLine = b.saveStatistic
-        ? `<div class="rcd-inv-meta"><strong>Save:</strong> ${b.saveBasic ? "Basic " : ""}${escapeHtml(b.saveStatistic.toUpperCase())} vs <strong>Class DC ${cardState.classDC}</strong></div>`
+      const traitsRow = (b.traits || [])
+        .map((t) => `<span class="rcd-trait">${escapeHtml(t)}</span>`)
+        .join("");
+
+      const inlineCheckStr = b.saveStatistic
+        ? `@Check[${b.saveStatistic}|dc:${cardState.classDC}${b.saveBasic ? "|basic" : ""}|traits:${(b.traits || []).join(",")}]`
         : "";
 
-      const dmgInline = b.damageDice
-        ? `<div class="rcd-inv-meta"><strong>Damage:</strong> <code>${escapeHtml(b.damageDice)} ${escapeHtml(b.damageType || "")}</code> ${
-            b.rolledDamageTotal !== null
-              ? `<span class="rcd-rolled-pill">= ${b.rolledDamageTotal} ${escapeHtml(b.damageType || "")}</span>`
-              : `<button type="button" class="rcd-chat-btn" data-rcd-action="roll-block-damage" data-block-id="${b.blockId}"><i class="fas fa-dice-d20"></i> Roll Damage</button>`
-          }</div>`
+      const templateStr = b.emanationFeet
+        ? `@Template[type:${b.runeSlug === "cruonign" ? "cone" : b.runeSlug === "ochygholl" ? "burst" : "emanation"}|distance:${b.emanationFeet}]`
         : "";
+
+      const saveAndAreaLine =
+        inlineCheckStr || templateStr
+          ? `<div class="rcd-inv-meta rcd-enriched-line">${inlineCheckStr ? `<strong>Save:</strong> ${inlineCheckStr}${b.unwillingOnly ? " <em>(unwilling only)</em>" : ""}` : ""} ${templateStr ? `<strong>Area:</strong> ${templateStr}` : ""}</div>`
+          : "";
+
+      // Degree condition breakdown with clickable PF2e @UUID condition pills + GM 1-click apply
+      const condOutcomeParts = [];
+      if (b.successConditions?.length) {
+        condOutcomeParts.push(`<div><strong>Success:</strong> ${b.successConditions.map(formatConditionEnricher).join(", ")}</div>`);
+      }
+      if (b.failConditions?.length) {
+        condOutcomeParts.push(`<div><strong>Failure:</strong> ${b.failConditions.map(formatConditionEnricher).join(", ")}</div>`);
+      }
+      if (b.critFailConditions?.length || b.critFailPersistent) {
+        const cfItems = (b.critFailConditions || []).map(formatConditionEnricher);
+        if (b.critFailPersistent) {
+          cfItems.push(`@Damage[${b.critFailPersistent}[persistent,${b.critFailPersistentType || b.damageType || "untyped"}]]`);
+        }
+        condOutcomeParts.push(`<div><strong>Critical Failure:</strong> ${cfItems.join(", ")}</div>`);
+      }
+      const degreeBoxHtml = condOutcomeParts.length
+        ? `<div class="rcd-effect-box rcd-outcomes-box">${condOutcomeParts.join("")}</div>`
+        : "";
+
+      // Expanded Granted Invocation Effect details + Apply to Selected Token button
+      const grantedBoxHtml = b.grantedEffectMeta
+        ? `<div class="rcd-effect-box">
+            <div class="rcd-effect-hdr">
+              <span>&#10024; <strong>${escapeHtml(b.grantedEffectMeta.name)}</strong></span>
+              <span class="rcd-effect-dur">${escapeHtml(b.grantedEffectMeta.durationLabel)}</span>
+            </div>
+            <p>${escapeHtml(b.grantedEffectMeta.details)}</p>
+            ${
+              b.grantedEffectMeta.effectItemData
+                ? `<button type="button" class="rcd-chat-btn rcd-btn-cyan" data-rcd-action="grant-effect-selected" data-block-id="${b.blockId}"><i class="fas fa-magic"></i> Apply Effect to Selected Token(s)</button>`
+                : ""
+            }
+            ${
+              b.grantedEffectMeta.healPairAmount
+                ? `<button type="button" class="rcd-chat-btn rcd-btn-cyan" data-rcd-action="heal-germantria-pair" data-block-id="${b.blockId}"><i class="fas fa-heart"></i> Heal Both Runesmith &amp; Bearer (+${b.grantedEffectMeta.healPairAmount} HP)</button>`
+                : ""
+            }
+          </div>`
+        : "";
+
+      const dmgRollLine =
+        b.damageDice || b.healingFormula
+          ? `<div class="rcd-inv-meta">
+              <strong>${b.healingFormula ? "Healing:" : "Damage:"}</strong>
+              <code>${escapeHtml(b.healingFormula || `${b.damageDice} ${b.damageType || ""}`)}</code>
+              ${
+                b.rolledDamageTotal !== null
+                  ? `<span class="rcd-rolled-pill">Rolled below (${b.rolledDamageTotal}) &mdash; use PF2e Damage / Half / Double / Block buttons</span>`
+                  : ""
+              }
+              <button type="button" class="rcd-chat-btn" data-rcd-action="roll-block-damage" data-block-id="${b.blockId}" title="Roll a fresh native PF2e Damage Card in chat">
+                <i class="fas fa-dice-d20"></i> ${b.rolledDamageTotal !== null ? "Re-Roll Damage Card" : "Roll Damage Card"}
+              </button>
+            </div>`
+          : "";
 
       const zohkBtn =
         b.special === "teleport-adjacent" && b.bearerTokenId
@@ -1553,11 +1965,19 @@ function renderInvocationCardHtml(cardState) {
             ? `<button type="button" class="rcd-chat-mini-btn" data-rcd-action="roll-target-save" data-block-id="${b.blockId}" data-target-idx="${idx}" title="Roll ${escapeHtml(t.saveStatistic)} save vs DC ${cardState.classDC}${t.savePenalty ? ` (${t.savePenalty} status)` : ""}"><i class="fas fa-shield-alt"></i> Save</button>`
             : "";
 
-          const applyBtns =
-            b.rolledDamageTotal !== null
-              ? t.damageApplied
-                ? `<span class="rcd-applied-tag">&#10003; Applied</span>`
-                : `<button type="button" class="rcd-chat-mini-btn rcd-btn-dmg" data-rcd-action="apply-target-outcome" data-block-id="${b.blockId}" data-target-idx="${idx}" title="Apply degree-scaled damage &amp; conditions">Apply</button>`
+          const condListForDeg =
+            t.degree === "criticalFailure"
+              ? b.critFailConditions
+              : t.degree === "failure"
+                ? b.failConditions
+                : t.degree === "success"
+                  ? b.successConditions
+                  : [];
+
+          const hasCritPersistent = t.degree === "criticalFailure" && Boolean(b.critFailPersistent);
+          const applyCondBtn =
+            condListForDeg?.length > 0 || hasCritPersistent
+              ? `<button type="button" class="rcd-chat-mini-btn" data-rcd-action="apply-target-conditions" data-block-id="${b.blockId}" data-target-idx="${idx}" title="Apply save condition(s) / persistent damage to ${escapeHtml(t.name)}">+ Cond</button>`
               : "";
 
           return `
@@ -1567,7 +1987,7 @@ function renderInvocationCardHtml(cardState) {
               <div class="rcd-target-controls">
                 ${degBadge}
                 ${rollSaveBtn}
-                ${applyBtns}
+                ${applyCondBtn}
               </div>
             </div>
           `;
@@ -1585,18 +2005,21 @@ function renderInvocationCardHtml(cardState) {
             <img src="${escapeHtml(b.icon)}" alt="${escapeHtml(b.shortName)}" />
             <div class="rcd-chat-title-wrap">
               <div class="rcd-chat-title">&#9889; ${escapeHtml(b.runeName)}</div>
-              <div class="rcd-chat-sub">Invoked on <strong>${escapeHtml(b.bearerName)}</strong></div>
+              <div class="rcd-chat-sub">Invoked from <strong>${escapeHtml(b.bearerName)}</strong></div>
             </div>
           </div>
+          <div class="rcd-trait-row">${traitsRow}</div>
           <div class="rcd-chat-body">
-            <p>${escapeHtml(b.summary)}</p>
-            ${saveLine}
-            ${dmgInline}
+            <p class="rcd-inv-fulltext">${escapeHtml(b.summary)}</p>
+            ${saveAndAreaLine}
+            ${degreeBoxHtml}
+            ${grantedBoxHtml}
+            ${dmgRollLine}
             ${zohkBtn}
             ${notesHtml}
             <div class="rcd-targets-box">
               <div class="rcd-targets-hdr">
-                <span>Affected Targets (${b.targets.length})</span>
+                <span>Targets (${b.targets.length})</span>
                 ${rollAllSavesBtn}
               </div>
               ${targetsRows}
@@ -1607,12 +2030,13 @@ function renderInvocationCardHtml(cardState) {
     })
     .join("");
 
-  return `
+  const rawHtml = `
     <div class="rcd-chat-card rcd-invocation-card">
-      <div class="rcd-inv-banner">${escapeHtml(cardState.actionLabel)} &bull; Class DC ${cardState.classDC}</div>
+      <div class="rcd-inv-banner">${escapeHtml(cardState.actionLabel)} [1A] &bull; Class DC ${cardState.classDC}</div>
       ${blocksHtml}
     </div>
   `;
+  return enrichHtmlSafe(rawHtml, rollData);
 }
 
 function formatDegreeLabel(deg) {
@@ -1638,8 +2062,8 @@ function computeDegreeOfSuccess(total, naturalDie, dc) {
 }
 
 async function postInvocationChatCard(actor, cardState) {
-  const html = renderInvocationCardHtml(cardState);
-  await ChatMessage.create({
+  const html = await renderInvocationCardHtml(cardState, actor?.getRollData?.() ?? {});
+  return ChatMessage.create({
     speaker: ChatMessage.getSpeaker({ actor }),
     content: html,
     flags: {
@@ -1674,22 +2098,19 @@ export function registerChatCardListeners() {
       const targetIdx = btn.dataset.targetIdx !== undefined ? Number(btn.dataset.targetIdx) : null;
 
       const latestMsg = game.messages?.get(message.id) ?? message;
+      const actorId = latestMsg.flags?.[MODULE_ID]?.actorId;
+      const actor = (actorId && game.actors?.get(actorId)) || latestMsg.actor || null;
       const state = foundry.utils.deepClone(latestMsg.flags?.[MODULE_ID]?.cardState);
       if (!state) return;
       const block = state.blocks.find((b) => b.blockId === blockId);
       if (!block) return;
 
-      if (action === "roll-block-damage" && block.damageDice) {
-        const expr = block.damageDice.includes("[")
-          ? block.damageDice
-          : `(${block.damageDice})[${block.damageType || "untyped"}]`;
-        const roll = await new Roll(expr).evaluate();
-        await roll.toMessage({
-          speaker: latestMsg.speaker,
-          flavor: `<strong>${escapeHtml(block.runeName)}</strong> — Invocation Damage`
-        });
-        block.rolledDamageTotal = Math.max(0, roll.total);
-        await updateInvocationMessage(latestMsg, state);
+      if (action === "roll-block-damage" && (block.damageDice || block.healingFormula)) {
+        const total = await rollNativePf2eDamageCard(actor, state, block);
+        if (total !== null) {
+          block.rolledDamageTotal = total;
+          await updateInvocationMessage(latestMsg, state);
+        }
       } else if (action === "roll-target-save" && targetIdx !== null) {
         await rollTargetSaveInBlock(state, block, targetIdx);
         await updateInvocationMessage(latestMsg, state);
@@ -1698,39 +2119,50 @@ export function registerChatCardListeners() {
           if (!block.targets[i].degree) await rollTargetSaveInBlock(state, block, i);
         }
         await updateInvocationMessage(latestMsg, state);
-      } else if (action === "apply-target-outcome" && targetIdx !== null) {
+      } else if (action === "apply-target-conditions" && targetIdx !== null) {
         const t = block.targets[targetIdx];
-        if (!t || block.rolledDamageTotal === null) return;
-        const deg = t.degree || "failure";
-        let mult = 1;
-        if (block.saveBasic) {
-          mult = deg === "criticalSuccess" ? 0 : deg === "success" ? 0.5 : deg === "criticalFailure" ? 2 : 1;
-        } else if (block.saveStatistic) {
-          mult = deg === "criticalSuccess" || deg === "success" ? 0 : deg === "criticalFailure" ? 2 : 1;
-        }
-        const finalDmg = Math.floor(block.rolledDamageTotal * mult);
-        if (finalDmg > 0 && t.actorUuid) {
-          await executeOnTargetActor(t.actorUuid, "applyDamage", {
-            amount: finalDmg,
-            damageType: block.damageType || "untyped"
-          });
-        }
-        // Apply degree-based conditions
+        if (!t?.actorUuid) return;
         const condList =
-          deg === "criticalFailure"
+          t.degree === "criticalFailure"
             ? block.critFailConditions
-            : deg === "failure"
+            : t.degree === "failure"
               ? block.failConditions
-              : deg === "success"
+              : t.degree === "success"
                 ? block.successConditions
                 : [];
         for (const c of condList || []) {
-          if (t.actorUuid) {
-            await executeOnTargetActor(t.actorUuid, "applyCondition", { slug: c.slug, value: c.value });
+          await executeOnTargetActor(t.actorUuid, "applyCondition", { slug: c.slug, value: c.value });
+        }
+        if (t.degree === "criticalFailure" && block.critFailPersistent) {
+          await executeOnTargetActor(t.actorUuid, "applyPersistent", {
+            formula: block.critFailPersistent,
+            damageType: block.critFailPersistentType || block.damageType || "untyped"
+          });
+        }
+        ui.notifications?.info(`Applied save outcome effect(s) to ${t.name}.`);
+      } else if (action === "grant-effect-selected" && block.grantedEffectMeta?.effectItemData) {
+        const controlled = canvas?.tokens?.controlled ?? [];
+        if (!controlled.length) {
+          ui.notifications?.warn("Select one or more tokens on the canvas first to apply this effect!");
+          return;
+        }
+        for (const tok of controlled) {
+          if (tok.actor?.uuid) {
+            await executeOnTargetActor(tok.actor.uuid, "createEffect", {
+              itemData: foundry.utils.deepClone(block.grantedEffectMeta.effectItemData)
+            });
           }
         }
-        t.damageApplied = true;
-        await updateInvocationMessage(latestMsg, state);
+        ui.notifications?.info(`Applied ${block.grantedEffectMeta.name} to ${controlled.length} token(s).`);
+      } else if (action === "heal-germantria-pair" && block.grantedEffectMeta?.healPairAmount) {
+        const amt = block.grantedEffectMeta.healPairAmount;
+        if (block.grantedEffectMeta.bearerUuid) {
+          await executeOnTargetActor(block.grantedEffectMeta.bearerUuid, "applyHealing", { amount: amt });
+        }
+        if (block.grantedEffectMeta.runesmithUuid && block.grantedEffectMeta.runesmithUuid !== block.grantedEffectMeta.bearerUuid) {
+          await executeOnTargetActor(block.grantedEffectMeta.runesmithUuid, "applyHealing", { amount: amt });
+        }
+        ui.notifications?.info(`Germantria healed both Runesmith and Rune-bearer for ${amt} HP!`);
       } else if (action === "zohk-teleport") {
         await performZohkTeleport(state, block);
       }
@@ -1755,7 +2187,9 @@ async function rollTargetSaveInBlock(state, block, idx) {
 }
 
 async function updateInvocationMessage(message, nextState) {
-  const content = renderInvocationCardHtml(nextState);
+  const actorId = message.flags?.[MODULE_ID]?.actorId;
+  const actor = (actorId && game.actors?.get?.(actorId)) || message.actor || null;
+  const content = await renderInvocationCardHtml(nextState, actor?.getRollData?.() ?? {});
   if (game.user?.isGM || message.isAuthor) {
     await message.update({
       content,

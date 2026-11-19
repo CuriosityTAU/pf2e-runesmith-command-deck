@@ -5,7 +5,7 @@ import {
   getRuneBySlug,
   getRunesmithLimits,
   isDiacriticCompatible
-} from "./runes-db.js";
+} from "./runes-db.js?v=1.3.0";
 import {
   MODULE_ID,
   applyDailyEtchPreset,
@@ -29,8 +29,8 @@ import {
   saveDailyEtchPreset,
   toggleRepertoireRune,
   transposeActiveRune
-} from "./rune-engine.js";
-import { clearCanvasRangeHighlight, highlightBearerOnCanvas } from "./canvas-badges.js";
+} from "./rune-engine.js?v=1.3.0";
+import { clearCanvasRangeHighlight, highlightBearerOnCanvas } from "./canvas-badges.js?v=1.3.0";
 
 let deckElement = null;
 let launcherElement = null;
@@ -76,14 +76,52 @@ export function toggleCommandDeck(forceState = null, options = {}) {
   renderLauncherPill();
 }
 
-export function closeCommandDeck() {
+export function closeCommandDeck(showPillAfter = true) {
   uiState.isOpen = false;
   clearCanvasRangeHighlight();
   if (deckElement) {
     deckElement.remove();
     deckElement = null;
   }
-  renderLauncherPill();
+  if (showPillAfter) {
+    renderLauncherPill();
+  } else if (launcherElement) {
+    launcherElement.remove();
+    launcherElement = null;
+    Hooks.callAll("pf2e-animist-command-deck.stateChanged");
+  }
+}
+
+/**
+ * Completely removes all Runesmith HUD elements (window, floating pill, and scene control button) from this user's screen.
+ */
+export async function dismissHudCompletely() {
+  closeCommandDeck(false);
+  await game.settings?.set?.(MODULE_ID, "showLauncherPill", false);
+  delete ui.controls?.controls?.tokens?.tools?.["runesmith-command-deck"];
+  document
+    .querySelectorAll('[data-tool="runesmith-command-deck"], [aria-label="Toggle Runesmith Command Deck"]')
+    .forEach((el) => el.closest("li")?.remove() || el.remove());
+  try {
+    ui.controls?.render?.({ reset: true });
+  } catch (_e) {
+    // Ignore control render errors
+  }
+}
+
+/**
+ * Restores HUD visibility when explicitly opened from a Character Sheet or API.
+ */
+export async function restoreHudVisibility(options = {}) {
+  if (game.settings?.get?.(MODULE_ID, "showLauncherPill") === false) {
+    await game.settings?.set?.(MODULE_ID, "showLauncherPill", true);
+    try {
+      ui.controls?.render?.({ reset: true });
+    } catch (_e) {
+      // Ignore control render errors
+    }
+  }
+  toggleCommandDeck(true, options);
 }
 
 function shouldShowRunesmithUI() {
@@ -94,18 +132,12 @@ function shouldShowRunesmithUI() {
 }
 
 export function renderLauncherPill() {
-  if (!shouldShowRunesmithUI()) {
+  const showPillSetting = game.settings?.get?.(MODULE_ID, "showLauncherPill") !== false;
+  if (!shouldShowRunesmithUI() || uiState.isOpen || !showPillSetting) {
     if (launcherElement) {
       launcherElement.remove();
       launcherElement = null;
-    }
-    return;
-  }
-
-  if (uiState.isOpen) {
-    if (launcherElement) {
-      launcherElement.remove();
-      launcherElement = null;
+      Hooks.callAll("pf2e-animist-command-deck.stateChanged");
     }
     return;
   }
@@ -115,21 +147,31 @@ export function renderLauncherPill() {
   const activeCount = state.activeRunes.length;
 
   if (!launcherElement) {
-    launcherElement = document.createElement("button");
-    launcherElement.type = "button";
+    launcherElement = document.createElement("div");
     launcherElement.id = "rcd-launcher-pill";
     launcherElement.className = "rcd-launcher-pill";
-    launcherElement.addEventListener("click", (ev) => {
+    launcherElement.addEventListener("click", async (ev) => {
       ev.preventDefault();
+      if (ev.target.closest("[data-rcd-hide-pill]")) {
+        ev.stopPropagation();
+        await dismissHudCompletely();
+        return;
+      }
       toggleCommandDeck(true);
     });
+    launcherElement.addEventListener("contextmenu", async (ev) => {
+      ev.preventDefault();
+      await dismissHudCompletely();
+    });
     document.body.appendChild(launcherElement);
+    Hooks.callAll("pf2e-animist-command-deck.stateChanged");
   }
 
   launcherElement.innerHTML = `
     <span class="rcd-launcher-glyph">&#9768;</span>
     <span class="rcd-launcher-text">Runesmith Deck</span>
     ${activeCount > 0 ? `<span class="rcd-launcher-count">${activeCount}</span>` : ""}
+    <button type="button" class="rcd-pill-hide" data-rcd-hide-pill="1" title="Remove Runesmith HUD completely from screen">&times;</button>
   `;
 }
 
@@ -154,7 +196,10 @@ export function renderCommandDeck() {
     deckElement.innerHTML = `
       <header class="rcd-header" data-rcd-drag="1">
         <div class="rcd-brand"><span class="rcd-sigil">&#9768;</span> Runesmith Command Deck</div>
-        <button type="button" class="rcd-icon-btn" data-action="close-deck" title="Close">&times;</button>
+        <div class="rcd-header-controls">
+          <button type="button" class="rcd-icon-btn" data-action="minimize-deck" title="Minimize to Bottom Pill">&minus;</button>
+          <button type="button" class="rcd-icon-btn rcd-btn-remove-hud" data-action="dismiss-hud-completely" title="Remove HUD Completely from Screen">&times;</button>
+        </div>
       </header>
       <div class="rcd-empty-state">
         <p>No owned character found. Create or take ownership of a Runesmith character (such as <strong>Runemaster</strong>) to begin.</p>
@@ -214,7 +259,8 @@ export function renderCommandDeck() {
           ${actorOptionsHtml}
         </select>
         <button type="button" class="rcd-icon-btn" data-action="open-sheet" title="Open Character Sheet"><i class="fas fa-id-card"></i></button>
-        <button type="button" class="rcd-icon-btn" data-action="close-deck" title="Minimize to Pill">&times;</button>
+        <button type="button" class="rcd-icon-btn" data-action="minimize-deck" title="Minimize to Bottom Pill">&minus;</button>
+        <button type="button" class="rcd-icon-btn rcd-btn-remove-hud" data-action="dismiss-hud-completely" title="Remove HUD Completely from Screen">&times;</button>
       </div>
     </header>
 
@@ -876,8 +922,15 @@ function bindDeckDelegatedEvents(root) {
     const actor = resolveRunesmithActor(uiState.selectedActorId);
 
     switch (action) {
+      case "minimize-deck":
       case "close-deck":
-        closeCommandDeck();
+        if (game.settings?.get?.(MODULE_ID, "showLauncherPill") === false) {
+          await game.settings?.set?.(MODULE_ID, "showLauncherPill", true);
+        }
+        closeCommandDeck(true);
+        break;
+      case "dismiss-hud-completely":
+        await dismissHudCompletely();
         break;
       case "open-sheet":
         actor?.sheet?.render(true);
@@ -1059,6 +1112,7 @@ export function registerUIHooks() {
   // Foundry v13 & v14 safe SceneControls registration (uses ONLY onChange on object tools per BUG-261024-01)
   Hooks.on("getSceneControlButtons", (controls) => {
     if (!shouldShowRunesmithUI()) return;
+    if (game.settings?.get?.(MODULE_ID, "showLauncherPill") === false) return;
 
     if (Array.isArray(controls)) {
       const tokenCtrl = controls.find((c) => c.name === "token" || c.name === "tokens");
@@ -1114,15 +1168,15 @@ export function registerUIHooks() {
       </div>
       <button type="button" class="rcd-btn rcd-btn-gold rcd-sb-open"><i class="fas fa-fire-alt"></i> Open Command Deck</button>
     `;
-    banner.querySelector(".rcd-sb-open")?.addEventListener("click", (ev) => {
+    banner.querySelector(".rcd-sb-open")?.addEventListener("click", async (ev) => {
       ev.preventDefault();
-      toggleCommandDeck(true, { actorId: actor.id, tab: "battle" });
+      await restoreHudVisibility({ actorId: actor.id, tab: "battle" });
     });
 
     const strikesTarget =
       root.querySelector(".sheet-body .strikes-list") ||
-      root.querySelector('[data-tab="actions"] .actions-list') ||
-      root.querySelector('[data-tab="actions"]');
+      root.querySelector('.sheet-body [data-tab="actions"] .actions-list') ||
+      root.querySelector('.sheet-body .tab[data-tab="actions"]');
     if (strikesTarget?.parentNode) {
       strikesTarget.parentNode.insertBefore(banner, strikesTarget);
     }
@@ -1131,6 +1185,7 @@ export function registerUIHooks() {
   // Intercept PF2e sheet action posts (Trace Rune, Invoke Rune, Engraving Strike, Fortifying Knock)
   Hooks.on("createChatMessage", (msg, _opts, userId) => {
     if (game.user?.id !== userId) return;
+    if (game.settings?.get?.(MODULE_ID, "showLauncherPill") === false) return;
     if (!game.settings?.get(MODULE_ID, "autoOpenOnSheetAction")) return;
     const slug = msg?.item?.slug || msg?.item?.system?.slug || "";
     const actor = msg?.actor;
