@@ -46,6 +46,30 @@
   border-radius: 999px;
 }
 
+.rcd-pill-hide {
+  width: 18px !important;
+  height: 18px !important;
+  min-height: 0;
+  padding: 0;
+  margin: 0 -4px 0 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.75);
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.rcd-pill-hide:hover {
+  background: #e11d48;
+  border-color: #fda4af;
+  color: #ffffff;
+}
+
 /* Main Floating Command Deck Window */
 .rcd-deck-window {
   position: fixed;
@@ -1370,4 +1394,83 @@
   background: linear-gradient(180deg, #dc2626 0%, #991b1b 100%);
   border-color: #fca5a5;
   color: #fff;
+}
+
+
+/* ==========================================================================
+   v1.3.0 — Complete HUD Dismiss (×) & Expanded Chat Effects / PF2e Enrichers
+   ========================================================================== */
+.rcd-btn-remove-hud:hover {
+  background: #e11d48 !important;
+  border-color: #fda4af !important;
+  color: #ffffff !important;
+}
+
+.rcd-effect-box {
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid #334155;
+  border-left: 3px solid #38bdf8;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 5px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rcd-outcomes-box {
+  border-left-color: #f59e0b;
+  font-size: 11.8px;
+  line-height: 1.45;
+}
+
+.rcd-effect-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11.5px;
+  color: #bae6fd;
+}
+
+.rcd-effect-dur {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.16);
+  color: #7dd3fc;
+}
+
+/* Ensure PF2e enriched @Check, @Damage, @Template, and @UUID pills are bright & readable */
+.rcd-chat-card a.content-link,
+.rcd-chat-card a.inline-check,
+.rcd-chat-card a.inline-roll,
+.rcd-chat-card span[data-pf2-check],
+.rcd-chat-card span[data-pf2-effect-area] {
+  background: #1e293b !important;
+  color: #f8fafc !important;
+  border: 1px solid #64748b !important;
+  border-radius: 4px;
+  padding: 1px 5px;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.rcd-chat-card a.content-link i,
+.rcd-chat-card span[data-pf2-check] i,
+.rcd-chat-card span[data-pf2-effect-area] i {
+  color: #fbbf24 !important;
+}
+
+.rcd-dmg-flavor-sub {
+  font-size: 12px;
+  margin: 3px 0;
+}
+
+.rcd-dmg-flavor-note {
+  font-size: 11.5px;
+  color: #b91c1c;
+  margin: 2px 0;
 }
